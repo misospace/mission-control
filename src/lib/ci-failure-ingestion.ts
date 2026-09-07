@@ -14,9 +14,14 @@
  * - **Every workflow is eligible.** The repeat rule is the noise filter. An
  *   allowlist would silently exclude whichever workflow nobody remembered to
  *   add, which is the failure this exists to catch.
- * - **A green run closes the issue.** An auto-filed issue nobody auto-closes
- *   goes stale the moment CI recovers, and a queue of stale auto-issues trains
- *   people to ignore the label.
+ * - **A second consecutive green closes the issue.** An auto-filed issue
+ *   nobody auto-closes goes stale the moment CI recovers, and a queue of stale
+ *   auto-issues trains people to ignore the label. But one green after a red
+ *   is as weak a signal as one red after a green, so it does not close — a
+ *   workflow that legitimately alternates red and green would otherwise be
+ *   closed on every green and refiled on every red, looping at the sync
+ *   interval (#953). Two greens in a row is the same "a condition, not an
+ *   accident" bar the file side already applies.
  * - **A recurrence files fresh, linking the old one.** A failure returning
  *   after its issue closed means the fix did not hold — new information, and it
  *   should re-enter the queue with its own priority rather than reopening an
@@ -118,19 +123,34 @@ export type WorkflowState =
   | { kind: "healthy"; latest: CiRun }
   | { kind: "first-failure"; latest: CiRun }
   | { kind: "repeated-failure"; latest: CiRun; previous: CiRun }
+  | { kind: "flapping"; latest: CiRun }
   | { kind: "unknown" };
 
 /**
  * Classify a workflow from its recent default-branch history.
  *
  * `healthy` is what closes an existing issue; `repeated-failure` is what files
- * one. `first-failure` deliberately does neither — it is the transient case,
- * and acting on it is what would flood the queue.
+ * one. `first-failure` and `flapping` deliberately do neither — they are the
+ * transient cases, and acting on them is what would flood the queue.
+ *
+ * The close rule is symmetric with the file rule: a single green after a red
+ * is as weak a signal as a single red after a green, so it does not close.
+ * `flapping` is that case — the latest run is green but the one before it
+ * failed. A workflow that legitimately alternates red and green (e.g. one that
+ * fails to *report* a condition) would otherwise be closed on every green and
+ * refiled on every red, looping at the sync interval (#953). Two greens in a
+ * row is the same "a condition, not an accident" bar the file side already
+ * applies, and it is what actually closes.
  */
 export function classifyWorkflow(history: WorkflowHistory): WorkflowState {
   const [latest, previous] = history.runs;
   if (!latest) return { kind: "unknown" };
-  if (latest.conclusion === "success") return { kind: "healthy", latest };
+  if (latest.conclusion === "success") {
+    if (previous && previous.conclusion === "failure") {
+      return { kind: "flapping", latest };
+    }
+    return { kind: "healthy", latest };
+  }
   if (latest.conclusion !== "failure") return { kind: "unknown" };
   if (!previous || previous.conclusion !== "failure") {
     return { kind: "first-failure", latest };
@@ -173,6 +193,12 @@ export function decideAction(
   }
   if (state.kind === "first-failure") {
     return { action: "none", reason: "first failure; waiting for a second to rule out a transient" };
+  }
+  if (state.kind === "flapping") {
+    // Green after a red is not enough to close: a workflow that alternates
+    // would otherwise be closed on every green and refiled on every red.
+    // Leave whatever is open alone and wait for a second green.
+    return { action: "none", reason: "green after a red; waiting for a second green to rule out a flapping workflow" };
   }
   if (state.kind === "unknown" || !signature) {
     return { action: "none", reason: "no actionable state" };

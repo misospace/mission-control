@@ -141,6 +141,39 @@ describe("classifyWorkflow", () => {
     expect(s.kind).toBe("healthy");
   });
 
+  it("does not call a green after a red healthy — that is flapping", () => {
+    // The close rule must be symmetric with the file rule: one green after a
+    // red is as weak a signal as one red after a green.
+    const s = classifyWorkflow({
+      workflowName: "Release",
+      runs: [run({ id: 3, conclusion: "success" }), run({ id: 2 })],
+    });
+    expect(s.kind).toBe("flapping");
+  });
+
+  it("calls two greens in a row healthy", () => {
+    const s = classifyWorkflow({
+      workflowName: "Release",
+      runs: [
+        run({ id: 3, conclusion: "success" }),
+        run({ id: 2, conclusion: "success" }),
+      ],
+    });
+    expect(s.kind).toBe("healthy");
+  });
+
+  it("does not call a green after a non-failure flapping", () => {
+    // A green after a cancelled/skipped run is not a red-then-green flap; it
+    // is just green.
+    for (const conclusion of ["cancelled", "skipped", "neutral", "timed_out"]) {
+      const s = classifyWorkflow({
+        workflowName: "Release",
+        runs: [run({ id: 3, conclusion: "success" }), run({ id: 2, conclusion })],
+      });
+      expect(s.kind).toBe("healthy");
+    }
+  });
+
   it("treats cancelled and skipped as unknown, not failure", () => {
     for (const conclusion of ["cancelled", "skipped", "neutral", "timed_out"]) {
       const s = classifyWorkflow({ workflowName: "R", runs: [run({ conclusion })] });
@@ -161,6 +194,10 @@ describe("decideAction", () => {
   const healthy = classifyWorkflow({
     workflowName: "Release",
     runs: [run({ id: 3, conclusion: "success" })],
+  });
+  const flapping = classifyWorkflow({
+    workflowName: "Release",
+    runs: [run({ id: 3, conclusion: "success" }), run({ id: 2 })],
   });
 
   it("files on a repeated failure with nothing open", () => {
@@ -196,6 +233,17 @@ describe("decideAction", () => {
   it("never files on a first failure", () => {
     const first = classifyWorkflow({ workflowName: "Release", runs: [run({ id: 3 })] });
     expect(decideAction(first, "sig1", [])).toMatchObject({ action: "none" });
+  });
+
+  it("does not close on a green after a red, even with an issue open", () => {
+    // The flapping case: a workflow that alternates red/green must not be
+    // closed on every green, or the next red refiles it and the pair loops.
+    const filed: FiledIssue[] = [{ number: 7, state: "open", signature: "sig1" }];
+    expect(decideAction(flapping, null, filed)).toMatchObject({ action: "none" });
+  });
+
+  it("does nothing on a green after a red with nothing open", () => {
+    expect(decideAction(flapping, null, [])).toMatchObject({ action: "none" });
   });
 
   it("closes an open issue when the workflow goes green", () => {
@@ -272,5 +320,79 @@ describe("buildCloseComment", () => {
     expect(c).toContain("https://example.test/9");
     expect(c).toContain("green again");
     expect(c).toContain("a fresh issue is filed");
+  });
+});
+
+describe("alternating red/green workflow (#953)", () => {
+  // Simulate the sync loop over a sequence of sync passes. Each pass sees the
+  // workflow's recent runs (newest first), classifies, decides, and applies the
+  // action to the local `filed` view exactly like the route does. The signature
+  // is held constant because the workflow fails for the same reason every time.
+  function simulatePasses(
+    timeline: ("success" | "failure")[],
+    historyWindow = 5,
+  ): { filed: FiledIssue[]; actions: string[] } {
+    const filed: FiledIssue[] = [];
+    const actions: string[] = [];
+    let nextNumber = 1;
+    for (let i = 0; i < timeline.length; i++) {
+      // The most recent i+1 runs, newest first, capped to the window.
+      const recent = timeline
+        .slice(0, i + 1)
+        .reverse()
+        .slice(0, historyWindow)
+        .map((conclusion, idx) => run({ id: i + 1 - idx, conclusion }));
+      const state = classifyWorkflow({ workflowName: "Release", runs: recent });
+      const signature = state.kind === "repeated-failure" ? "sig1" : null;
+      const action = decideAction(state, signature, filed);
+      actions.push(
+        action.action === "file" ? `file#${action.supersedes ?? "none"}` : action.action,
+      );
+      if (action.action === "close") {
+        const target = filed.find((f) => f.number === action.issueNumber);
+        if (target) target.state = "closed";
+      } else if (action.action === "file") {
+        filed.push({ number: nextNumber++, state: "open", signature: action.signature });
+      }
+    }
+    return { filed, actions };
+  }
+
+  it("files at most one issue over several alternating passes", () => {
+    // red, red (file), green (flap), red (first), red (already filed), green
+    // (flap), red (first), red (already filed), green (flap).
+    const timeline: ("success" | "failure")[] = [
+      "failure", "failure", "success", "failure", "failure", "success",
+      "failure", "failure", "success",
+    ];
+    const { filed, actions } = simulatePasses(timeline);
+    expect(filed).toHaveLength(1);
+    expect(filed[0].state).toBe("open");
+    // No pass ever closed the one issue that was filed.
+    expect(actions).not.toContain("close");
+  });
+
+  it("still closes a genuinely resolved failure after two greens", () => {
+    // red, red (file), green (flap), green (healthy → close).
+    const timeline: ("success" | "failure")[] = [
+      "failure", "failure", "success", "success",
+    ];
+    const { filed, actions } = simulatePasses(timeline);
+    expect(filed).toHaveLength(1);
+    expect(filed[0].state).toBe("closed");
+    expect(actions).toContain("close");
+  });
+
+  it("refiles with the supersedes link when a fixed failure returns", () => {
+    // red, red (file #1), green, green (close #1), red, red (re-file #2 → #1).
+    const timeline: ("success" | "failure")[] = [
+      "failure", "failure", "success", "success", "failure", "failure",
+    ];
+    const { filed, actions } = simulatePasses(timeline);
+    expect(filed).toHaveLength(2);
+    expect(filed[0]).toEqual({ number: 1, state: "closed", signature: "sig1" });
+    expect(filed[1]).toEqual({ number: 2, state: "open", signature: "sig1" });
+    expect(actions).toContain("close");
+    expect(actions).toContain("file#1");
   });
 });
