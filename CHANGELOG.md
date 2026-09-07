@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.56](https://github.com/misospace/dispatch/compare/v0.5.55...v0.5.56) (2026-09-07)
+
+
+### Bug Fixes
+
+* **ci-failures:** only close an issue for the workflow that went green ([#955](https://github.com/misospace/dispatch/issues/955)) ([cc5df2f](https://github.com/misospace/dispatch/commit/cc5df2f8e147caac5cca73630ece82db947699f1))
+
 ## [0.5.55](https://github.com/misospace/dispatch/compare/v0.5.54...v0.5.55) (2026-09-07)
 
 
