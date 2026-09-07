@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.5.55](https://github.com/misospace/dispatch/compare/v0.5.54...v0.5.55) (2026-09-07)
+
+
+### Features
+
+* **deps:** update dependency lucide-react (1.41.0 → 1.42.0) ([#951](https://github.com/misospace/dispatch/issues/951)) ([ebe8506](https://github.com/misospace/dispatch/commit/ebe8506eacd46654bc6d4e3fc56efc01872fdff1))
+
+
+### Bug Fixes
+
+* **ci-failures:** require two consecutive greens before closing an issue ([#954](https://github.com/misospace/dispatch/issues/954)) ([89d8baa](https://github.com/misospace/dispatch/commit/89d8baaeab89fcd9978c38828791af0b44f9fc28)), closes [#953](https://github.com/misospace/dispatch/issues/953)
+
+
+### Chores
+
+* **deps:** lock file maintenance ([#950](https://github.com/misospace/dispatch/issues/950)) ([6834727](https://github.com/misospace/dispatch/commit/683472702911cf4dae97ee72e7f2a256ce2212dd))
+
 ## [0.5.54](https://github.com/misospace/dispatch/compare/v0.5.53...v0.5.54) (2026-09-06)
 
 
