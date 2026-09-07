@@ -35,9 +35,31 @@
 
 import { createHash } from "crypto";
 
-/** Marker embedded in an auto-filed issue body, mirroring the AI reviewer's. */
+/** Marker embedded in an auto-filed issue body, mirroring the AI reviewer's.
+ *
+ * Carries the WORKFLOW as well as the signature. Without it `filed` is a
+ * repo-wide list with no workflow association, and the healthy-close path then
+ * closes the first open issue in the repo whichever workflow went green — so a
+ * green `Release` run would close a still-failing `Vulnerability Scan` issue,
+ * which refiles on the next pass, forever.
+ *
+ * The workflow is base64url-encoded so a name containing `-->`, a colon or a
+ * newline cannot break out of the comment or the field split. */
 const MARKER_PREFIX = "dispatch-ci-failure";
-const MARKER_RE = /<!--\s*dispatch-ci-failure:([a-z0-9]+)\s*-->/i;
+const MARKER_RE = /<!--\s*dispatch-ci-failure:([a-z0-9]+)(?::([A-Za-z0-9_-]*))?\s*-->/i;
+
+function encodeWorkflow(workflowName: string): string {
+  return Buffer.from(workflowName, "utf8").toString("base64url");
+}
+
+function decodeWorkflow(encoded: string | undefined): string | null {
+  if (!encoded) return null;
+  try {
+    return Buffer.from(encoded, "base64url").toString("utf8") || null;
+  } catch {
+    return null;
+  }
+}
 
 /** A workflow run, narrowed to what this module needs. */
 export interface CiRun {
@@ -81,13 +103,21 @@ export function computeFailureSignature(input: FailureSignatureInput): string {
     .slice(0, 16);
 }
 
-export function buildFailureMarker(signature: string): string {
-  return `<!-- ${MARKER_PREFIX}:${signature} -->`;
+export function buildFailureMarker(signature: string, workflowName?: string): string {
+  const suffix = workflowName ? `:${encodeWorkflow(workflowName)}` : "";
+  return `<!-- ${MARKER_PREFIX}:${signature}${suffix} -->`;
 }
 
 export function extractFailureMarker(body: string | null | undefined): string | null {
   const m = MARKER_RE.exec(body || "");
   return m ? m[1].toLowerCase() : null;
+}
+
+/** The workflow an auto-filed issue belongs to, or null for a pre-#956 issue
+ *  whose marker carries only a signature. */
+export function extractFailureWorkflow(body: string | null | undefined): string | null {
+  const m = MARKER_RE.exec(body || "");
+  return m ? decodeWorkflow(m[2]) : null;
 }
 
 /** Runs for one workflow on the default branch, newest first. */
@@ -162,6 +192,10 @@ export interface FiledIssue {
   number: number;
   state: "open" | "closed";
   signature: string;
+  /** Workflow this issue was filed for. null for issues filed before the
+   *  marker carried it; those are never auto-closed, since closing an issue
+   *  whose owner is unknown is what this field exists to prevent. */
+  workflowName?: string | null;
 }
 
 export type IngestAction =
@@ -180,16 +214,29 @@ export function decideAction(
   state: WorkflowState,
   signature: string | null,
   filed: FiledIssue[],
+  workflowName?: string,
 ): IngestAction {
   const openForSignature = filed.find((i) => i.state === "open" && i.signature === signature);
 
   if (state.kind === "healthy") {
-    // Close whatever is open for this workflow, whichever signature it carries:
-    // the workflow is green, so no failure of it is outstanding.
-    const anyOpen = filed.find((i) => i.state === "open");
+    // Close whatever is open FOR THIS WORKFLOW, whichever signature it carries:
+    // this workflow is green, so no failure of it is outstanding.
+    //
+    // Scoping to the workflow is the whole point. `filed` is a repo-wide list,
+    // so matching on open-ness alone let any green workflow close another
+    // workflow's issue: a green `Release` closed a still-failing
+    // `Vulnerability Scan` issue, which refiled on the next pass and closed
+    // again on the next green, looping every sync interval (#956).
+    //
+    // An issue whose marker predates the workflow field has workflowName null
+    // and is never matched. That leaks a stale issue rather than closing a
+    // live one, which is the safer direction: a human closes it once.
+    const anyOpen = workflowName
+      ? filed.find((i) => i.state === "open" && i.workflowName === workflowName)
+      : undefined;
     return anyOpen
       ? { action: "close", issueNumber: anyOpen.number, signature: anyOpen.signature }
-      : { action: "none", reason: "workflow is green and nothing is open" };
+      : { action: "none", reason: "workflow is green and nothing is open for it" };
   }
   if (state.kind === "first-failure") {
     return { action: "none", reason: "first failure; waiting for a second to rule out a transient" };
@@ -250,7 +297,7 @@ export function buildIssueDraft(opts: {
       `This failure was filed before as #${supersedes} and closed. It has returned, so the earlier fix did not hold.`,
     );
   }
-  lines.push("", buildFailureMarker(opts.signature));
+  lines.push("", buildFailureMarker(opts.signature, opts.workflowName));
   return {
     title: `CI: ${workflowName} failing on the default branch (${jobName})`,
     body: lines.join("\n"),

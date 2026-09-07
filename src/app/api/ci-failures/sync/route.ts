@@ -19,6 +19,7 @@ import {
   computeFailureSignature,
   decideAction,
   extractFailureMarker,
+  extractFailureWorkflow,
   groupDefaultBranchRuns,
   type CiRun,
   type FiledIssue,
@@ -60,6 +61,7 @@ async function filedIssuesFor(repoFullName: string): Promise<FiledIssue[]> {
       number: issue.number,
       state: issue.state === "closed" ? "closed" : "open",
       signature,
+      workflowName: extractFailureWorkflow(issue.body),
     });
   }
   return filed;
@@ -134,7 +136,7 @@ export async function POST(request: NextRequest) {
             });
           }
 
-          const action = decideAction(state, signature, filed);
+          const action = decideAction(state, signature, filed, history.workflowName);
           if (action.action === "none") {
             skipped.push({
               repo: repoFullName,

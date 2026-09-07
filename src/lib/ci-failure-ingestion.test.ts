@@ -7,6 +7,7 @@ import {
   computeFailureSignature,
   decideAction,
   extractFailureMarker,
+  extractFailureWorkflow,
   groupDefaultBranchRuns,
   type CiRun,
   type FiledIssue,
@@ -247,8 +248,10 @@ describe("decideAction", () => {
   });
 
   it("closes an open issue when the workflow goes green", () => {
-    const filed: FiledIssue[] = [{ number: 7, state: "open", signature: "sig1" }];
-    expect(decideAction(healthy, null, filed)).toEqual({
+    const filed: FiledIssue[] = [
+      { number: 7, state: "open", signature: "sig1", workflowName: "Release" },
+    ];
+    expect(decideAction(healthy, null, filed, "Release")).toEqual({
       action: "close",
       issueNumber: 7,
       signature: "sig1",
@@ -257,9 +260,15 @@ describe("decideAction", () => {
 
   it("closes an open issue even if the current signature differs", () => {
     // Green means no failure of this workflow is outstanding, whatever the
-    // open issue was originally about.
-    const filed: FiledIssue[] = [{ number: 7, state: "open", signature: "old" }];
-    expect(decideAction(healthy, "new", filed)).toMatchObject({ action: "close", issueNumber: 7 });
+    // open issue was originally about — but it must still be THIS workflow's
+    // issue (#956).
+    const filed: FiledIssue[] = [
+      { number: 7, state: "open", signature: "old", workflowName: "Release" },
+    ];
+    expect(decideAction(healthy, "new", filed, "Release")).toMatchObject({
+      action: "close",
+      issueNumber: 7,
+    });
   });
 
   it("does nothing when green with nothing open", () => {
@@ -268,6 +277,68 @@ describe("decideAction", () => {
 
   it("does nothing without a signature", () => {
     expect(decideAction(repeated, null, [])).toMatchObject({ action: "none" });
+  });
+});
+
+describe("cross-workflow closing (#956)", () => {
+  const healthy = classifyWorkflow({
+    workflowName: "Release",
+    runs: [run({ id: 3, conclusion: "success" }), run({ id: 2, conclusion: "success" })],
+  });
+
+  it("does not close another workflow's issue when this one goes green", () => {
+    // The bug: `filed` is repo-wide, so a green Release closed a still-failing
+    // Vulnerability Scan issue, which refiled next pass and closed on the next
+    // green — a loop at the sync interval.
+    const filed: FiledIssue[] = [
+      { number: 7, state: "open", signature: "sig-vuln", workflowName: "Vulnerability Scan" },
+    ];
+    expect(decideAction(healthy, null, filed, "Release")).toMatchObject({ action: "none" });
+  });
+
+  it("closes its own workflow's issue", () => {
+    const filed: FiledIssue[] = [
+      { number: 7, state: "open", signature: "sig-vuln", workflowName: "Vulnerability Scan" },
+      { number: 8, state: "open", signature: "sig-rel", workflowName: "Release" },
+    ];
+    expect(decideAction(healthy, null, filed, "Release")).toMatchObject({
+      action: "close",
+      issueNumber: 8,
+    });
+  });
+
+  it("never closes an issue whose marker predates the workflow field", () => {
+    // Leaking a stale issue is safer than closing a live one; a human closes
+    // it once.
+    const filed: FiledIssue[] = [
+      { number: 7, state: "open", signature: "sig1", workflowName: null },
+    ];
+    expect(decideAction(healthy, null, filed, "Release")).toMatchObject({ action: "none" });
+  });
+
+  it("closes nothing when the caller supplies no workflow", () => {
+    const filed: FiledIssue[] = [
+      { number: 7, state: "open", signature: "sig1", workflowName: "Release" },
+    ];
+    expect(decideAction(healthy, null, filed)).toMatchObject({ action: "none" });
+  });
+
+  it("round-trips the workflow through the marker", () => {
+    const marker = buildFailureMarker("abc123", "Vulnerability Scan");
+    expect(extractFailureMarker(marker)).toBe("abc123");
+    expect(extractFailureWorkflow(marker)).toBe("Vulnerability Scan");
+  });
+
+  it("survives a workflow name containing marker syntax", () => {
+    const nasty = "weird --> :name\nwith newline";
+    const marker = buildFailureMarker("abc123", nasty);
+    expect(extractFailureMarker(marker)).toBe("abc123");
+    expect(extractFailureWorkflow(marker)).toBe(nasty);
+  });
+
+  it("reads a legacy marker with no workflow as null", () => {
+    expect(extractFailureMarker("<!-- dispatch-ci-failure:abc123 -->")).toBe("abc123");
+    expect(extractFailureWorkflow("<!-- dispatch-ci-failure:abc123 -->")).toBeNull();
   });
 });
 
@@ -344,7 +415,7 @@ describe("alternating red/green workflow (#953)", () => {
         .map((conclusion, idx) => run({ id: i + 1 - idx, conclusion }));
       const state = classifyWorkflow({ workflowName: "Release", runs: recent });
       const signature = state.kind === "repeated-failure" ? "sig1" : null;
-      const action = decideAction(state, signature, filed);
+      const action = decideAction(state, signature, filed, "Release");
       actions.push(
         action.action === "file" ? `file#${action.supersedes ?? "none"}` : action.action,
       );
@@ -352,7 +423,12 @@ describe("alternating red/green workflow (#953)", () => {
         const target = filed.find((f) => f.number === action.issueNumber);
         if (target) target.state = "closed";
       } else if (action.action === "file") {
-        filed.push({ number: nextNumber++, state: "open", signature: action.signature });
+        filed.push({
+          number: nextNumber++,
+          state: "open",
+          signature: action.signature,
+          workflowName: "Release",
+        });
       }
     }
     return { filed, actions };
@@ -390,8 +466,8 @@ describe("alternating red/green workflow (#953)", () => {
     ];
     const { filed, actions } = simulatePasses(timeline);
     expect(filed).toHaveLength(2);
-    expect(filed[0]).toEqual({ number: 1, state: "closed", signature: "sig1" });
-    expect(filed[1]).toEqual({ number: 2, state: "open", signature: "sig1" });
+    expect(filed[0]).toMatchObject({ number: 1, state: "closed", signature: "sig1" });
+    expect(filed[1]).toMatchObject({ number: 2, state: "open", signature: "sig1" });
     expect(actions).toContain("close");
     expect(actions).toContain("file#1");
   });
